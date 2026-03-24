@@ -1,26 +1,31 @@
 ---
 name: update-pr
-description: Incorporate feedback into a pull request. Fetches PR review comments from GitHub, accepts additional feedback from any text source (review transcripts, emails, Slack threads), categorizes each piece of feedback, applies actionable changes to local files, and generates a chronological response document. This skill is invoked explicitly by the user via /update-pr -- do not trigger it automatically.
+description: Incorporate feedback into a pull request. Fetches PR review comments from GitHub, accepts additional feedback from any text source (review transcripts, emails, Slack threads), walks through each comment one at a time with before/after context, and generates an actionable summary document with draft replies and a re-request review checklist. This skill is invoked explicitly by the user via /update-pr -- do not trigger it automatically.
 ---
 
 # Update PR with Review Feedback
 
-This skill drives a structured workflow for incorporating feedback into a pull request. It handles feedback from GitHub PR comments and any supplementary text the user provides (review transcripts, meeting notes, pasted messages).
+This skill performs NO write operations on GitHub. No comments, no pushes, no PR updates, no review submissions, no thread resolution. All GitHub interactions are read-only fetches. The user posts replies and pushes commits themselves.
 
-The workflow has three phases: **Fetch**, **Apply**, **Summarize**. Complete them in order.
+## Overview
+
+The workflow has three phases:
+
+1. **Fetch** — collect all PR comments and supplementary feedback
+2. **Review** — walk through each comment one at a time with the user, showing before/after context
+3. **Apply & Summarize** — apply accepted changes (GitHub suggestions first, then local edits), generate an actionable summary document
 
 ## Before You Start
 
-The user must provide the PR number — either as an argument to `/update-pr` (e.g., `/update-pr 1234`) or in the conversation. Do not guess or auto-detect the PR number. If the user didn't provide one, ask for it before doing anything else.
+The user must provide the PR number — either as an argument (e.g., `/update-pr 1234`) or in the conversation. If they didn't provide one, ask before doing anything else.
 
-Once you have the PR number, gather remaining context and confirm with the user in a single checkpoint:
+Once you have the PR number, derive the repo owner/name from the git remote (do not run `gh repo view` — it's unnecessary). Then gather context and confirm with the user in a single checkpoint:
 
-1. **Repo owner/name** — run `gh repo view --json owner,name --jq '"\(.owner.login)/\(.name)"'`.
-2. **Scope** — check which files the PR touches (`gh pr diff <PR> --name-only`) to suggest a default scope.
-3. **Supplementary feedback** — note whether the user mentioned any non-GitHub feedback sources.
+1. **Scope** — check which files the PR touches (`gh pr diff <PR> --name-only`) to suggest a default scope.
+2. **Supplementary feedback** — note whether the user mentioned any non-GitHub feedback sources (transcripts, pasted text, files).
 
-Present this to the user for confirmation:
-- "PR #X in owner/repo, targeting these files: [list]. Any files out of scope for changes? Any supplementary feedback to incorporate (transcripts, pasted text, etc.)?"
+Present this for confirmation:
+- "PR #X in owner/repo, targeting these files: [list]. Any files out of scope for changes? Any supplementary feedback to incorporate?"
 
 Proceed only after the user confirms or adjusts.
 
@@ -36,8 +41,8 @@ Two API calls are needed because PR feedback lives in two places.
 gh pr view <PR> --json comments,reviews,title,body
 ```
 
-This returns:
-- `reviews[]` — each has `.author.login`, `.body`, `.state` (APPROVED/COMMENTED/CHANGES_REQUESTED), `.submittedAt`
+Returns:
+- `reviews[]` — `.author.login`, `.body`, `.state`, `.submittedAt`
 - `comments[]` — general PR conversation comments (not inline)
 
 **Inline code review comments** (attached to specific lines in the diff):
@@ -47,147 +52,241 @@ gh api repos/<owner>/<repo>/pulls/<PR>/comments
 ```
 
 Each comment includes:
-- `.user.login` — reviewer
-- `.path` — file path
-- `.original_line` — line number in the diff
-- `.body` — the comment text
-- `.created_at` — timestamp
+- `.user.login`, `.path`, `.original_line`, `.body`, `.created_at`
 - `.in_reply_to_id` — parent comment ID if this is a reply in a thread
 
 This endpoint can return large payloads (64KB+ for active PRs). If the tool harness persists the output to a file, read that file.
 
+**Data integrity:** Comment bodies — especially suggestion blocks — must never be truncated. Read every comment body in full. Suggestion blocks contain the exact proposed replacement text and must be compared character-by-character against the current file to determine if they've already been applied.
+
 ### Supplementary Feedback
 
-If the user indicated supplementary feedback sources during the checkpoint:
-- **Review transcripts** — files like `Review-transcript.md` containing notes from verbal reviews or recorded walkthroughs
-- **Pasted text** — feedback copied from email, Slack, or other channels
-- **Referenced files** — the user may point to files in the repo containing feedback
+If the user indicated supplementary feedback sources:
+- **Review transcripts** — files containing notes from verbal reviews or recorded walkthroughs
+- **Pasted text** — feedback from email, Slack, or other channels
+- **Referenced files** — files in the repo containing feedback
 
-Read and extract actionable items from these sources.
+Read and extract feedback items from these sources.
 
-### Build a Unified Timeline
+### Group Reply Chains
 
-Merge all fetched feedback into a single chronological list using the timestamps already retrieved. Sort GitHub comments by their timestamps (`.created_at` for inline, `.submittedAt` for reviews). Place supplementary feedback without timestamps at the end, noting the source.
-
-### Resolve Comment Threads
-
-Before categorizing, resolve comment threads. PR comments often have reply chains where feedback evolves — a reviewer may clarify, soften, or retract their original point in a follow-up reply. Use `in_reply_to_id` to group threaded comments together. When a thread exists:
+Before reviewing, group threaded comments using `in_reply_to_id`. PR comments often have reply chains where feedback evolves — a reviewer may clarify, soften, or retract their original point in a follow-up. When a thread exists:
 
 - Read the full thread to understand the final position
 - If a later reply retracts or supersedes the original feedback, treat the thread as a single unit reflecting the final state
 - Attribute the thread to the original commenter unless a different reviewer's reply changes the nature of the feedback
 
-## Phase 2: Apply Feedback
+### Cross-Check Comment Count
 
-### Categorize Each Comment
+After grouping, verify that every fetched comment appears in exactly one group (standalone or threaded). Compare the total count of fetched comments against the count of items to review. Flag any discrepancy before proceeding — a missing comment means a reviewer's feedback could be silently ignored.
 
-For every piece of feedback (or resolved thread), assign exactly one category:
+If the PR has no GitHub comments and no supplementary feedback was provided, report this to the user and stop — there is nothing to review.
 
-| Category | Meaning | Action |
-|---|---|---|
-| **Actionable** | Can be addressed in the current changeset within the confirmed scope | Apply the change |
-| **Deferred** | Valid feedback but out of scope (e.g., references files not in this PR) | Note in response doc |
-| **Future work** | Acknowledged by the commenter as follow-up, not blocking | Note in response doc |
-| **Retracted** | Commenter withdrew the feedback in a later comment or thread reply | Note in response doc |
-| **Non-actionable** | Approval, praise, questions already answered, or informational | Note in response doc |
+## Phase 2: Review Each Comment
 
-### Present Categorization for Review
+Walk through each comment (or consolidated thread) one at a time. This is a single pass — categorization and the user's decision happen together. Never batch multiple items into one question.
 
-Before applying any changes, present the categorization to the user using grouped lists so they can verify and adjust:
+### Before/After Context Is Mandatory
+
+For every comment that references a code or text change, read the actual file content at the referenced location. The user cannot evaluate a change without seeing the concrete diff. Do not describe changes in prose when you can show the text.
+
+### Determine Comment Type
+
+Each comment falls into one of two types, which determines the decision flow:
+
+**Change comments** — the reviewer proposes a specific modification (suggestion block, requested edit, or rewrite). These need a code decision:
+
+- **Accept** — apply the change as proposed
+- **Accept + Revise** — apply it, then make additional modifications on top
+- **Reject** — don't apply; user provides reasoning for their reply
+- **Alternative** — apply a different change; user describes what to do instead
+- **Already applied** — the change was already made in a prior commit
+
+**Discussion comments** — questions, observations, or feedback that don't propose a specific change. These need a reply decision:
+
+- **Answer** — user provides the answer to include in their draft reply
+- **Acknowledge** — user agrees or notes the feedback
+- **Defer** — valid but out of scope; user provides reasoning
+- **No action needed** — approval, praise, or already-answered questions
+
+### Mandatory Question Format
+
+Use `AskUserQuestion` for each item. The question text must follow this structure — do not deviate:
+
+For **change comments**, include before/after context:
 
 ```
-**Actionable (N)**
-- <author> on <file:line> — <summary>
-- <author> on <file:line> — <summary>
+**[reviewer_handle] on [file]:[line]:** [condensed feedback]
 
-**Deferred (N)**
-- <author> on <file:line> — <summary> (<reason>)
+> [reviewer's quoted comment, or suggestion block content]
 
-**Future work (N)**
-- <author> on <file:line> — <summary>
+- Before: [exact current text from the file, quoted]
+- After: [exact proposed replacement text, quoted]
 
-**Retracted (N)**
-- <author> on <file:line> — <summary>
-
-**Non-actionable (N)**
-- <author> (<location>) — <summary>
+What would you like to do?
 ```
 
-This is a checkpoint — the user may recategorize items or adjust scope. Wait for confirmation before proceeding.
+Options: Accept | Accept + Revise | Reject | Alternative | Already applied
 
-### Interactive Review of Actionable Items
+For **discussion comments**:
 
-The user is the PR author — they may disagree with feedback, want to modify the approach, or have context the reviewer didn't. Before applying any changes, walk through each **Actionable** item one at a time so the user can decide what to do.
+```
+**[reviewer_handle] on [file]:[line] (or "top-level review"):** [condensed feedback]
 
-For each actionable comment, present:
-- The reviewer, location, and quoted feedback
-- A suggested change (what you would do to address it)
+> [reviewer's quoted comment]
 
-Then use `AskUserQuestion` to get the user's decision. Provide these options:
-- **Accept** — agree with the feedback, apply the suggested change
-- **Reject** — disagree with the feedback
-- **Modify** — partially agree, do something different
+How would you like to handle this?
+```
 
-The user can also select "Other" to type any response they want. Whatever the user says — their chosen option, notes, or free-form text — becomes the basis for the Resolution in the response document. Capture what they say faithfully. If they reject or modify, their reasoning is what they'll later post on the PR, so accuracy matters.
+Options: Answer | Acknowledge | Defer | No action needed
 
-After walking through all actionable items:
-- Apply changes only for items the user accepted or modified
-- For modified items, implement the user's stated approach, not the original reviewer suggestion
-- Rejected items get no code changes but their reasoning is recorded for the response doc
+The user can always select "Other" to provide free-form text. Whatever the user says — option, notes, or free-form — becomes the basis for the draft reply in the summary document. Capture their words faithfully; this is what they'll adapt when posting on the PR.
 
-### Apply Changes
+### Reviewer References
 
-For each accepted or modified item:
+When referring to reviewers in questions or the output document, use their handle directly (e.g., "jane requested..." not "she requested...") or use "they/them" as default neutral pronouns. Never infer gender from names.
+
+### Already-Applied Verification
+
+Before categorizing any comment as "already applied," diff the suggestion or proposed change against the current file content. If they don't match exactly, it's a change comment that needs a decision. Partial matches (e.g., the suggestion includes additional text beyond what was applied) are not "already applied."
+
+## Phase 3: Apply Changes & Generate Summary
+
+### Step 1: Separate GitHub Suggestions from Local Edits
+
+After the review pass, separate accepted changes into two groups:
+
+**GitHub-mergeable suggestions** — accepted items (Accept or Accept + Revise) that have a GitHub `suggestion` block. Applying these through the GitHub UI creates a commit credited to the reviewer, which is valuable for team dynamics and PR history. For Accept + Revise items, the suggestion is applied on GitHub first, then the user's revision is applied locally on top after pulling — this preserves reviewer attribution for the base change while layering the user's modifications.
+
+**Local edits** — everything else (items without suggestion blocks, alternatives, revisions on top of merged suggestions, and cleanup work).
+
+### Step 2: GitHub Suggestions First
+
+Present the GitHub-mergeable suggestions to the user via `AskUserQuestion`. Include the count and a checklist:
+
+```
+N suggestions can be applied via GitHub's "Apply suggestion" button for reviewer attribution.
+Which would you like to handle on GitHub?
+```
+
+For each suggestion, show the reviewer, file, and the change. Options for each:
+- **I'll apply on GitHub** — user will apply it in the PR UI
+- **Apply locally instead** — skip GitHub attribution, apply as a local edit
+- **Already applied** — user already merged it
+
+After the user indicates which ones they'll apply on GitHub, instruct them:
+
+1. Apply the suggestions on the GitHub PR page
+2. Stash any uncommitted local changes (`git stash`)
+3. Pull the new commits (`git pull`)
+4. Restore local state (`git stash pop`)
+
+Wait for the user to confirm they've completed this. Then verify each suggestion landed by reading the file and confirming the expected text is present. Report any that didn't land before proceeding.
+
+### Step 3: Apply Local Edits
+
+For each remaining accepted or modified item:
 1. Edit the referenced files
-2. Verify the changes make sense in context (read surrounding code)
+2. Verify changes make sense in context (read surrounding code)
 
-After all changes are applied, run the project's test command if one is discoverable (e.g., `make test`, `make test-unit`, or similar from Makefile targets). Report any test failures — do not silently proceed past broken tests.
+After all changes are applied, run the project's test command if discoverable (e.g., `make test`, `make test-unit`, or similar from Makefile targets). Report any test failures.
 
-The user controls commits. Changes are applied to the working tree and left uncommitted so the user can review diffs, stage selectively, and commit with their preferred message and workflow.
+Changes are left uncommitted — the user controls staging, diffs, and commit messages.
 
-## Phase 3: Response Document
+### Step 4: Cross-Check — Every Comment Needs a Resolution Path
 
-Generate `pr-comment-response.md` in the repository root. The user posts PR responses themselves — this file is their reference for what was done and why.
+Before generating the summary, verify every fetched comment has a clear resolution:
 
-### Format
+| Resolution type | What happened | Reply needed? |
+|---|---|---|
+| Applied via GitHub suggestion | Reviewer gets commit attribution | No (GitHub auto-marks) |
+| Applied locally | Code changed but reviewer has no signal | Yes — draft a reply noting the change |
+| Rejected | No code change | Yes — draft a reply with user's reasoning |
+| Alternative applied | Different change than suggested | Yes — draft a reply explaining the approach |
+| Discussion answered | No code change | Yes — draft the answer |
+| Deferred | Out of scope | Yes — draft a reply with reasoning |
+| Already applied | Changed in a prior commit | Yes — brief reply noting which commit |
+| No action needed | Approval, praise | No |
 
-Use this exact structure:
+Flag any comment that lacks a resolution path. Every reviewer comment (except pure approvals) should map to either "resolved by code change" or "needs reply to draft."
+
+### Step 5: Generate Summary Document
+
+Write `PR-<number>-Comment-Summary.md` (e.g., `PR-1301-Comment-Summary.md`) in the repository root.
+
+Use this structure:
 
 ```markdown
-# PR <number> Comment Responses
+# PR <number> Comment Summary
 
 PR: <title>
 Generated: <date>
 
-## Comment Responses
+## Draft Replies
 
-### <timestamp> — <author> on <file:line> (or "top-level review") [<Decision>]
+Replies to post on the PR to acknowledge reviewer feedback and address comment threads.
 
-> <quoted feedback, condensed to essential point>
+- [ ] **<reviewer_handle> on <file:line>** [<Decision>]
+  > <condensed feedback>
+  **Draft reply:** <reply text based on user's words from the review>
 
-**Resolution:** <the user's own words from the interactive review, or brief explanation for non-actionable categories>
+(repeat for each comment needing a reply)
+
+## Re-Request Reviews
+
+After posting replies and pushing changes, re-request review from these reviewers:
+
+- [ ] **<reviewer_handle>** — <brief note on what was addressed for them>
+
+(repeat for each reviewer who left actionable feedback)
+
+## Applied via GitHub Suggestions
+
+These were applied through GitHub's suggestion feature. Reviewer attribution is preserved.
+No action needed — GitHub auto-resolves these threads.
+
+- <reviewer_handle> on <file:line> — <summary>
+
+## Applied Locally
+
+These changes were applied to local files and will be included in the next push.
+
+- <reviewer_handle> on <file:line> — <summary>
+
+## No Action Needed
+
+Approvals, praise, and informational comments that require no response.
+
+- <reviewer_handle> — <summary>
+
+<details>
+<summary>Full Comment Log</summary>
+
+### <timestamp> — <reviewer_handle> on <file:line> [<Decision>]
+
+> <quoted feedback>
+
+**Resolution:** <user's own words from the review, or explanation for non-actionable categories>
 
 ---
 
-(repeat for each comment, in chronological order)
+(repeat for every comment, in chronological order)
 
-## Additional Changes
-
-Changes made during this update that were not triggered by specific comments:
-
-- <description of change>
+</details>
 ```
 
-Key format rules:
-- **Chronological order** — entries ordered by timestamp so the user can correlate with the PR's comment timeline while scrolling through GitHub
-- **Every comment gets an entry** — even non-actionable ones (approvals, praise) get a brief entry so the user knows nothing was missed
-- **Decision tag in heading** — each entry's heading includes the decision in brackets. For actionable items: `[Accepted]`, `[Rejected]`, or `[Modified]`. For other items: `[Deferred]`, `[Future Work]`, `[Retracted]`, or `[Non-actionable]`
-- **User's voice in resolutions** — for actionable items, the Resolution reflects the user's own words from the interactive review (accepted, rejected with reasoning, or modified approach). This is the text the user will adapt when posting responses on the PR, so preserve their intent and tone
-- **Additional changes section** — any changes made during the update that weren't triggered by a specific comment (e.g., fixing something discovered while applying feedback)
+Format rules:
 
-### After Generating the Response Document
+- **Checkboxes (`- [ ]`) only on items requiring user action** — draft replies to post and reviews to re-request. Informational items (already applied, no action needed) use plain `- ` bullets. If checking the box doesn't correspond to a discrete action the user performs, it is not a checkbox.
+- **Chronological order in the full log** — entries ordered by timestamp so the user can correlate with the PR's comment timeline on GitHub
+- **User's voice in draft replies** — resolutions reflect the user's own words from the interactive review. This is the text they'll adapt when posting on the PR, so preserve their intent and tone.
+- **Full comment log is collapsible** — wrapped in `<details>` so it doesn't dominate the output. The action items sections above are the primary working surface; the log exists as an audit trail for completeness.
+
+### After Generating the Summary
 
 Report to the user:
-- How many comments were fetched
-- Breakdown by category (actionable, deferred, future work, retracted, non-actionable)
+- Total comments fetched
+- Breakdown: applied via GitHub, applied locally, rejected, deferred, no action needed
+- Count of draft replies to post
+- Count of reviewers to re-request
 - Any test results from the verification step
