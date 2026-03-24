@@ -1,19 +1,21 @@
 # update-pr
 
-A Claude Code skill for incorporating PR review feedback into local files and generating a response document.
+A Claude Code skill for incorporating PR review feedback. Walks through each comment one at a time with before/after context, prioritizes GitHub suggestion attribution, and generates an actionable summary with draft replies and a re-request review checklist.
+
+All GitHub interactions are read-only. The user posts replies and pushes commits themselves.
 
 ## What It Does
 
-When invoked via `/update-pr`, this skill:
+When invoked via `/update-pr <PR-number>`, this skill:
 
 1. **Fetches** all PR comments from GitHub (top-level reviews and inline code comments)
 2. **Accepts** supplementary feedback from any text source (review transcripts, emails, Slack threads)
-3. **Categorizes** each piece of feedback (actionable, deferred, future work, retracted, non-actionable)
-4. **Reviews** each actionable item with you interactively — accept, reject, or modify with your reasoning
-5. **Applies** accepted and modified changes to local files within a confirmed scope
-6. **Generates** `pr-comment-response.md` — a chronological response document using your own words for each resolution
+3. **Reviews** each comment one at a time — shows before/after context, asks for your decision (accept, reject, revise, defer)
+4. **Applies GitHub suggestions first** via the PR UI for reviewer attribution, then applies remaining changes locally
+5. **Cross-checks** that every comment has a resolution path (code change or draft reply)
+6. **Generates** `PR-<number>-Comment-Summary.md` with checkboxed action items: draft replies to post and reviewers to re-request
 
-The skill stops before committing. You decide when and how to commit.
+Changes are left uncommitted. You control staging, diffs, and commit messages.
 
 ## Installation
 
