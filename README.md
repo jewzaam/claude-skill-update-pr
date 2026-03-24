@@ -9,8 +9,9 @@ When invoked via `/update-pr`, this skill:
 1. **Fetches** all PR comments from GitHub (top-level reviews and inline code comments)
 2. **Accepts** supplementary feedback from any text source (review transcripts, emails, Slack threads)
 3. **Categorizes** each piece of feedback (actionable, deferred, future work, retracted, non-actionable)
-4. **Applies** actionable changes to local files within a confirmed scope
-5. **Generates** `pr-comment-response.md` — a chronological reference document for posting responses back to the PR
+4. **Reviews** each actionable item with you interactively — accept, reject, or modify with your reasoning
+5. **Applies** accepted and modified changes to local files within a confirmed scope
+6. **Generates** `pr-comment-response.md` — a chronological response document using your own words for each resolution
 
 The skill stops before committing. You decide when and how to commit.
 
@@ -33,10 +34,10 @@ ln -s /path/to/claude-skill-update-pr ~/.claude/skills/update-pr
 From a branch with an open PR:
 
 ```
-/update-pr
+/update-pr 1234
 ```
 
-The skill will ask for the PR number (if not inferrable from the branch) and confirm which files are in scope before making changes.
+The PR number is required. The skill will confirm which files are in scope before making changes.
 
 ## Requirements
 
