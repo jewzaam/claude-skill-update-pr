@@ -19,7 +19,7 @@ The workflow has three phases:
 
 The user must provide the PR number — either as an argument (e.g., `/update-pr 1234`) or in the conversation. If they didn't provide one, ask before doing anything else.
 
-Once you have the PR number, derive the repo owner/name from the git remote (do not run `gh repo view` — it's unnecessary). Then gather context and confirm with the user in a single checkpoint:
+Once you have the PR number, derive the repo owner/name from the git remote (do not run `gh repo view` — it's unnecessary). Then confirm scope with the user before fetching comments:
 
 1. **Scope** — check which files the PR touches (`gh pr diff <PR> --name-only`) to suggest a default scope.
 2. **Supplementary feedback** — note whether the user mentioned any non-GitHub feedback sources (transcripts, pasted text, files).
@@ -27,13 +27,13 @@ Once you have the PR number, derive the repo owner/name from the git remote (do 
 Present this for confirmation:
 - "PR #X in owner/repo, targeting these files: [list]. Any files out of scope for changes? Any supplementary feedback to incorporate?"
 
-Proceed only after the user confirms or adjusts.
+Proceed only after the user confirms or adjusts. Do not report comment counts here — that information isn't available until after the Phase 1 fetch. The resolution filtering report comes at the end of Phase 1, after all comments are fetched, grouped, and filtered.
 
 ## Phase 1: Fetch Feedback
 
 ### GitHub PR Comments
 
-Two API calls are needed because PR feedback lives in two places.
+Three API calls are needed. They are independent — run all three in parallel to minimize latency.
 
 **Top-level reviews** (approve/request-changes/comment left via GitHub's Review button):
 
@@ -57,6 +57,31 @@ Each comment includes:
 
 This endpoint can return large payloads (64KB+ for active PRs). If the tool harness persists the output to a file, read that file.
 
+**Review thread resolution status** (which threads are resolved on GitHub):
+
+```bash
+gh api graphql -f query='
+  query($owner: String!, $repo: String!, $pr: Int!) {
+    repository(owner: $owner, name: $repo) {
+      pullRequest(number: $pr) {
+        reviewThreads(first: 100) {
+          nodes {
+            isResolved
+            comments(first: 1) {
+              nodes { id databaseId }
+            }
+          }
+        }
+      }
+    }
+  }
+' -f owner='<owner>' -f repo='<repo>' -F pr=<PR>
+```
+
+Each thread's `isResolved` flag maps to its first comment's `databaseId`, which corresponds to the `id` field from the REST inline comments endpoint. Build a set of resolved comment IDs from this data.
+
+The `first: 100` limit covers most PRs. If the response includes `pageInfo.hasNextPage: true`, paginate to fetch all threads — missing a resolved thread means its comments will incorrectly appear as unresolved. Add `pageInfo { hasNextPage endCursor }` to the query and pass `after: <endCursor>` on subsequent requests.
+
 **Data integrity:** Comment bodies — especially suggestion blocks — must never be truncated. Read every comment body in full. Suggestion blocks contain the exact proposed replacement text and must be compared character-by-character against the current file to determine if they've already been applied.
 
 ### Supplementary Feedback
@@ -78,17 +103,25 @@ Before reviewing, group threaded comments using `in_reply_to_id`. PR comments of
 
 ### Cross-Check Comment Count
 
-After grouping, verify that every fetched comment appears in exactly one group (standalone or threaded). Compare the total count of fetched comments against the count of items to review. Flag any discrepancy before proceeding — a missing comment means a reviewer's feedback could be silently ignored.
+After grouping, verify that every fetched comment appears in exactly one group (standalone or threaded). The total number of individual comments across all groups must equal the total number of fetched comments. Flag any discrepancy before proceeding — a missing comment means a reviewer's feedback could be silently ignored. This check is about grouping completeness, not review count — the number of groups to review will be smaller after resolved threads are filtered in the next step.
 
 If the PR has no GitHub comments and no supplementary feedback was provided, report this to the user and stop — there is nothing to review.
 
+### Filter Out Resolved Comments
+
+Using the resolution status from the GraphQL query, remove all comments belonging to resolved threads. Resolved threads are always skipped — this is not optional and should never be presented as a choice to the user. Only unresolved threads and supplementary feedback items proceed to Phase 2.
+
+Report the filtering result before starting Phase 2: "N comments fetched, M already resolved on GitHub, K unresolved comments to review." If all comments are resolved and there's no supplementary feedback, report this and stop — there is nothing to review.
+
 ## Phase 2: Review Each Comment
 
-Walk through each comment (or consolidated thread) one at a time. This is a single pass — categorization and the user's decision happen together. Never batch multiple items into one question.
+Walk through each **unresolved** comment (or consolidated thread) one at a time. This is a single pass — categorization and the user's decision happen together. Never batch multiple items into one question. Never present resolved comments — they were filtered out in Phase 1.
 
 ### Before/After Context Is Mandatory
 
 For every comment that references a code or text change, read the actual file content at the referenced location. The user cannot evaluate a change without seeing the concrete diff. Do not describe changes in prose when you can show the text.
+
+**Line mapping caveat:** After force-pushes, the `original_line` from the API refers to a line in the original diff, not the current file. Use the comment body and surrounding context (quoted code, suggestion blocks) to locate the correct position in the current file rather than trusting the line number blindly. Search for the quoted text in the file to find the actual location.
 
 ### Determine Comment Type
 
@@ -97,10 +130,10 @@ Each comment falls into one of two types, which determines the decision flow:
 **Change comments** — the reviewer proposes a specific modification (suggestion block, requested edit, or rewrite). These need a code decision:
 
 - **Accept** — apply the change as proposed
-- **Accept + Revise** — apply it, then make additional modifications on top
 - **Reject** — don't apply; user provides reasoning for their reply
-- **Alternative** — apply a different change; user describes what to do instead
 - **Already applied** — the change was already made in a prior commit
+
+The user can always select "Other" to provide free-form text — covering cases like applying with modifications, applying an alternative change, or any nuanced response.
 
 **Discussion comments** — questions, observations, or feedback that don't propose a specific change. These need a reply decision:
 
@@ -126,7 +159,7 @@ For **change comments**, include before/after context:
 What would you like to do?
 ```
 
-Options: Accept | Accept + Revise | Reject | Alternative | Already applied
+Options: Accept | Reject | Already applied
 
 For **discussion comments**:
 
@@ -156,7 +189,7 @@ Before categorizing any comment as "already applied," diff the suggestion or pro
 
 After the review pass, separate accepted changes into two groups:
 
-**GitHub-mergeable suggestions** — accepted items (Accept or Accept + Revise) that have a GitHub `suggestion` block. Applying these through the GitHub UI creates a commit credited to the reviewer, which is valuable for team dynamics and PR history. For Accept + Revise items, the suggestion is applied on GitHub first, then the user's revision is applied locally on top after pulling — this preserves reviewer attribution for the base change while layering the user's modifications.
+**GitHub-mergeable suggestions** — accepted items that have a GitHub `suggestion` block. Applying these through the GitHub UI creates a commit credited to the reviewer, which is valuable for team dynamics and PR history. If the user accepted a suggestion but added modifications via free-form text, apply the suggestion on GitHub first, then apply the user's revision locally after pulling — this preserves reviewer attribution for the base change while layering the user's modifications.
 
 **Local edits** — everything else (items without suggestion blocks, alternatives, revisions on top of merged suggestions, and cleanup work).
 
@@ -202,10 +235,10 @@ Before generating the summary, verify every fetched comment has a clear resoluti
 | Applied via GitHub suggestion | Reviewer gets commit attribution | No (GitHub auto-marks) |
 | Applied locally | Code changed but reviewer has no signal | Yes — draft a reply noting the change |
 | Rejected | No code change | Yes — draft a reply with user's reasoning |
-| Alternative applied | Different change than suggested | Yes — draft a reply explaining the approach |
 | Discussion answered | No code change | Yes — draft the answer |
 | Deferred | Out of scope | Yes — draft a reply with reasoning |
 | Already applied | Changed in a prior commit | Yes — brief reply noting which commit |
+| Resolved on GitHub | Thread already resolved before this run | No — already handled |
 | No action needed | Approval, praise | No |
 
 Flag any comment that lacks a resolution path. Every reviewer comment (except pure approvals) should map to either "resolved by code change" or "needs reply to draft."
@@ -253,6 +286,10 @@ These changes were applied to local files and will be included in the next push.
 
 - <reviewer_handle> on <file:line> — <summary>
 
+## Already Resolved on GitHub
+
+N threads were already resolved before this review session. No action taken.
+
 ## No Action Needed
 
 Approvals, praise, and informational comments that require no response.
@@ -286,7 +323,7 @@ Format rules:
 
 Report to the user:
 - Total comments fetched
-- Breakdown: applied via GitHub, applied locally, rejected, deferred, no action needed
+- Breakdown: already resolved on GitHub, applied via GitHub suggestion, applied locally, rejected, deferred, no action needed
 - Count of draft replies to post
 - Count of reviewers to re-request
 - Any test results from the verification step
