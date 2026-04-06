@@ -1,6 +1,6 @@
 ---
 name: update-pr
-description: Incorporate feedback into a pull request. Fetches PR review comments from GitHub, accepts additional feedback from any text source (review transcripts, emails, Slack threads), walks through each comment one at a time with before/after context, and generates an actionable summary document with draft replies and a re-request review checklist. This skill is invoked explicitly by the user via /update-pr -- do not trigger it automatically.
+description: Incorporate feedback into a pull request. Fetches PR review comments from GitHub, accepts additional feedback from any text source (review transcripts, emails, Slack threads), generates a traceability document mapping comments to findings for upfront confirmation, walks through each comment one at a time with before/after context, and updates the document with resolutions and draft replies. This skill is invoked explicitly by the user via /update-pr -- do not trigger it automatically.
 ---
 
 # Update PR with Review Feedback
@@ -11,9 +11,9 @@ This skill performs NO write operations on GitHub. No comments, no pushes, no PR
 
 The workflow has three phases:
 
-1. **Fetch** — collect all PR comments and supplementary feedback
-2. **Review** — walk through each comment one at a time with the user, showing before/after context
-3. **Apply & Summarize** — apply accepted changes (GitHub suggestions first, then local edits), generate an actionable summary document
+1. **Fetch & Map** — collect all PR comments and supplementary feedback, generate a traceability document mapping comments to findings for user confirmation
+2. **Review** — walk through each unresolved comment one at a time with the user, showing before/after context
+3. **Apply & Update** — handle GitHub suggestions, update the traceability document with resolutions and draft replies, hand off accepted local edits to apply-review
 
 ## Before You Start
 
@@ -65,6 +65,7 @@ gh api graphql -f query='
     repository(owner: $owner, name: $repo) {
       pullRequest(number: $pr) {
         reviewThreads(first: 100) {
+          pageInfo { hasNextPage endCursor }
           nodes {
             isResolved
             comments(first: 1) {
@@ -80,7 +81,7 @@ gh api graphql -f query='
 
 Each thread's `isResolved` flag maps to its first comment's `databaseId`, which corresponds to the `id` field from the REST inline comments endpoint. Build a set of resolved comment IDs from this data.
 
-The `first: 100` limit covers most PRs. If the response includes `pageInfo.hasNextPage: true`, paginate to fetch all threads — missing a resolved thread means its comments will incorrectly appear as unresolved. Add `pageInfo { hasNextPage endCursor }` to the query and pass `after: <endCursor>` on subsequent requests.
+The `first: 100` limit covers most PRs. If `pageInfo.hasNextPage` is `true`, paginate by passing `after: <endCursor>` on subsequent requests — missing a resolved thread means its comments will incorrectly appear as unresolved.
 
 **Data integrity:** Comment bodies — especially suggestion blocks — must never be truncated. Read every comment body in full. Suggestion blocks contain the exact proposed replacement text and must be compared character-by-character against the current file to determine if they've already been applied.
 
@@ -113,9 +114,88 @@ Using the resolution status from the GraphQL query, remove all comments belongin
 
 Report the filtering result before starting Phase 2: "N comments fetched, M already resolved on GitHub, K unresolved comments to review." If all comments are resolved and there's no supplementary feedback, report this and stop — there is nothing to review.
 
+### Generate Review Traceability Document
+
+After filtering, generate `Review-PR-<number>.md` in the repository root. This document maps every PR comment to a finding and every finding back to its source comments, giving the user a complete picture before the interactive walkthrough begins.
+
+**Constraint: no new findings.** Findings consolidate what reviewers raised — nothing more. If a comment doesn't map to a broader finding, it stands alone. The skill's role is to organize and present reviewer feedback, not to perform independent code review.
+
+Use this structure:
+
+```markdown
+# Review Traceability: PR <number>
+
+PR: <title>
+Generated: <date>
+Total comments: <N fetched> (<M resolved>, <K unresolved>)
+
+## Comment Traceability
+
+All unresolved PR comments, mapped to findings. Resolved comments are excluded.
+
+### <Reviewer Handle> (<count> threads)
+
+| # | Comment | File | Finding |
+|---|---------|------|---------|
+| 1 | <condensed feedback> | `<file:line>` | <Finding ID (e.g., I0, S1) or "—"> |
+| 2 | ... | ... | ... |
+
+(repeat table per reviewer)
+
+### Summary
+
+| Status | Count |
+|--------|-------|
+| Mapped to finding | <count> |
+| Standalone (no finding) | <count> |
+| Already resolved on GitHub | <M> |
+| **Total** | **<N>** |
+
+## Findings
+
+Consolidated findings from unresolved PR comments. Each finding groups related comments and traces back to its sources.
+
+**<I0>: <Short title>**
+- **PR comments:** <reviewer> #<number>, <reviewer> #<number>
+- **File:** `<file:line>`
+- **Description:** <what the reviewers flagged>
+- **Suggested fix:** <from reviewer comments, not independent analysis>
+
+(repeat for each finding)
+```
+
+Format rules:
+
+- **Finding IDs** use standard review prefixes — `I0`, `I1` for important issues, `S0`, `S1` for suggestions, `C0`, `C1` for clarifications — sequential within each category. Severity assessment is out of scope; the prefix indicates the type of reviewer feedback (proposed fix vs. suggestion vs. question), not a priority ranking.
+- **Every finding must trace to at least one PR comment.** If a finding has no comment link, it was invented — remove it. This is the hard constraint.
+- **Every unresolved comment must appear in exactly one reviewer table.** Cross-check the total against the filtered count.
+- **Comment numbering is local** — the `#` column starts at 1 per reviewer table and is only meaningful within this document. Finding references like `matburt #5` refer to row 5 in matburt's table, not a GitHub comment ID.
+- **Standalone comments** (mapped to "—") are valid — not every comment needs to be part of a broader finding. These proceed to Phase 2 as individual items.
+- **Resolved comments are excluded** from the traceability tables. They appear only in the summary count.
+
+Use `AskUserQuestion` to present the document and wait for confirmation before proceeding to Phase 2:
+
+```
+Review traceability document generated: Review-PR-<number>.md
+
+<K> unresolved comments mapped to <F> findings, <S> standalone.
+<M> resolved comments excluded.
+
+Please review the document. You can:
+- Adjust finding groupings (split or merge)
+- Remove findings you consider invalid
+- Flag comments that were miscategorized
+
+Confirm to proceed, or describe adjustments.
+```
+
+Incorporate any adjustments before starting the interactive walkthrough.
+
 ## Phase 2: Review Each Comment
 
-Walk through each **unresolved** comment (or consolidated thread) one at a time. This is a single pass — categorization and the user's decision happen together. Never batch multiple items into one question. Never present resolved comments — they were filtered out in Phase 1.
+Walk through each **unresolved** comment one at a time. This is a single pass — categorization and the user's decision happen together. Never batch multiple items into one question. Never present resolved comments — they were filtered out in Phase 1.
+
+Even when multiple comments map to the same finding, present each comment individually — the user needs to provide a reply to each one. For example, if comments #3, #7, and #12 all map to finding I0, present three separate questions. Reference the finding ID in each question so the user sees the connection, but each comment gets its own decision.
 
 ### Before/After Context Is Mandatory
 
@@ -132,8 +212,6 @@ Each comment falls into one of two types, which determines the decision flow:
 - **Accept** — apply the change as proposed
 - **Reject** — don't apply; user provides reasoning for their reply
 - **Already applied** — the change was already made in a prior commit
-
-The user can always select "Other" to provide free-form text — covering cases like applying with modifications, applying an alternative change, or any nuanced response.
 
 **Discussion comments** — questions, observations, or feedback that don't propose a specific change. These need a reply decision:
 
@@ -216,24 +294,14 @@ After the user indicates which ones they'll apply on GitHub, instruct them:
 
 Wait for the user to confirm they've completed this. Then verify each suggestion landed by reading the file and confirming the expected text is present. Report any that didn't land before proceeding.
 
-### Step 3: Apply Local Edits
-
-For each remaining accepted or modified item:
-1. Edit the referenced files
-2. Verify changes make sense in context (read surrounding code)
-
-After all changes are applied, run the project's test command if discoverable (e.g., `make test`, `make test-unit`, or similar from Makefile targets). Report any test failures.
-
-Changes are left uncommitted — the user controls staging, diffs, and commit messages.
-
-### Step 4: Cross-Check — Every Comment Needs a Resolution Path
+### Step 3: Cross-Check — Every Comment Needs a Resolution Path
 
 Before generating the summary, verify every fetched comment has a clear resolution:
 
 | Resolution type | What happened | Reply needed? |
 |---|---|---|
 | Applied via GitHub suggestion | Reviewer gets commit attribution | No (GitHub auto-marks) |
-| Applied locally | Code changed but reviewer has no signal | Yes — draft a reply noting the change |
+| Accepted for local edit | Handed off to apply-review | Yes — draft a reply noting the planned change |
 | Rejected | No code change | Yes — draft a reply with user's reasoning |
 | Discussion answered | No code change | Yes — draft the answer |
 | Deferred | Out of scope | Yes — draft a reply with reasoning |
@@ -243,19 +311,16 @@ Before generating the summary, verify every fetched comment has a clear resoluti
 
 Flag any comment that lacks a resolution path. Every reviewer comment (except pure approvals) should map to either "resolved by code change" or "needs reply to draft."
 
-### Step 5: Generate Summary Document
+### Step 4: Update Traceability and Generate Summary
 
-Write `PR-<number>-Comment-Summary.md` (e.g., `PR-1301-Comment-Summary.md`) in the repository root.
+Update the `Review-PR-<number>.md` traceability document from Phase 1 with the resolution status for each comment (applied, rejected, deferred, etc.) and the user's decision. Then append the action-item sections below.
 
-Use this structure:
+Add these sections to the traceability document:
 
 ```markdown
-# PR <number> Comment Summary
+## Resolutions
 
-PR: <title>
-Generated: <date>
-
-## Draft Replies
+### Draft Replies
 
 Replies to post on the PR to acknowledge reviewer feedback and address comment threads.
 
@@ -265,7 +330,7 @@ Replies to post on the PR to acknowledge reviewer feedback and address comment t
 
 (repeat for each comment needing a reply)
 
-## Re-Request Reviews
+### Re-Request Reviews
 
 After posting replies and pushing changes, re-request review from these reviewers:
 
@@ -273,57 +338,64 @@ After posting replies and pushing changes, re-request review from these reviewer
 
 (repeat for each reviewer who left actionable feedback)
 
-## Applied via GitHub Suggestions
+### Applied via GitHub Suggestions
 
 These were applied through GitHub's suggestion feature. Reviewer attribution is preserved.
 No action needed — GitHub auto-resolves these threads.
 
 - <reviewer_handle> on <file:line> — <summary>
 
-## Applied Locally
+### Pending Local Edits
 
-These changes were applied to local files and will be included in the next push.
+These findings were accepted and will be applied via `/apply-review`. The handoff command is in Step 5.
 
-- <reviewer_handle> on <file:line> — <summary>
+- <reviewer_handle> on <file:line> — <finding ID> — <summary>
 
-## Already Resolved on GitHub
-
-N threads were already resolved before this review session. No action taken.
-
-## No Action Needed
+### No Action Needed
 
 Approvals, praise, and informational comments that require no response.
 
 - <reviewer_handle> — <summary>
+```
 
-<details>
-<summary>Full Comment Log</summary>
+Also update the Comment Traceability tables to include the resolution status column:
 
-### <timestamp> — <reviewer_handle> on <file:line> [<Decision>]
-
-> <quoted feedback>
-
-**Resolution:** <user's own words from the review, or explanation for non-actionable categories>
-
----
-
-(repeat for every comment, in chronological order)
-
-</details>
+```markdown
+| # | Comment | File | Finding | Resolution |
+|---|---------|------|---------|------------|
+| 1 | <condensed feedback> | `<file:line>` | I0 | Pending — apply-review |
 ```
 
 Format rules:
 
 - **Checkboxes (`- [ ]`) only on items requiring user action** — draft replies to post and reviews to re-request. Informational items (already applied, no action needed) use plain `- ` bullets. If checking the box doesn't correspond to a discrete action the user performs, it is not a checkbox.
-- **Chronological order in the full log** — entries ordered by timestamp so the user can correlate with the PR's comment timeline on GitHub
 - **User's voice in draft replies** — resolutions reflect the user's own words from the interactive review. This is the text they'll adapt when posting on the PR, so preserve their intent and tone.
-- **Full comment log is collapsible** — wrapped in `<details>` so it doesn't dominate the output. The action items sections above are the primary working surface; the log exists as an audit trail for completeness.
+- **Single document** — all traceability, findings, and resolutions live in `Review-PR-<number>.md`. Do not generate a separate summary file.
+
+### Step 5: Hand Off Local Edits to apply-review
+
+Do not apply local code changes directly. Delegate to the `apply-review` skill, which has the per-finding discipline (implement, validate, handoff, stage, commit).
+
+Collect the finding IDs for all accepted local edits. Then use `AskUserQuestion` to hand off:
+
+```
+Local edits are ready to apply. When you're ready, run:
+
+/apply-review Review-PR-<number>.md I0 I2 S0
+
+This will apply each finding as an isolated, tested, committed change.
+```
+
+The finding IDs listed must be exactly the accepted local edits — exclude GitHub suggestions (already applied), rejected items, deferred items, and discussion-only comments.
+
+This is a gate — the user must acknowledge it. Do not apply code changes in this skill. The skill's job ends with the traceability document and draft replies.
+
+If there are no accepted local edits (all items were GitHub suggestions, rejections, deferrals, or discussion), skip this step — there is nothing to hand off.
 
 ### After Generating the Summary
 
 Report to the user:
 - Total comments fetched
-- Breakdown: already resolved on GitHub, applied via GitHub suggestion, applied locally, rejected, deferred, no action needed
+- Breakdown: already resolved on GitHub, applied via GitHub suggestion, accepted for local edit (pending apply-review), rejected, deferred, no action needed
 - Count of draft replies to post
 - Count of reviewers to re-request
-- Any test results from the verification step
